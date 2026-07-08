@@ -1,7 +1,7 @@
 // ProjectBudget dashboard frontend (phase 5).
 "use strict";
 
-const state = { range: "6mo", account: "all", anchor: "latest" };
+const state = { range: "6mo", account: "all", anchor: "latest", start: null, end: null };
 let categories = [];
 let catChart = null, trendChart = null;
 
@@ -12,6 +12,8 @@ const PALETTE = [
 
 const fmt = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" });
 const $ = (sel) => document.querySelector(sel);
+// Chart colors come from the CSS theme variables so light/dark both work.
+const cssVar = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 
 async function api(path, opts) {
   const res = await fetch(path, opts);
@@ -35,11 +37,27 @@ async function loadAccounts() {
 
 async function loadReport() {
   const q = new URLSearchParams({ range: state.range, account: state.account, anchor: state.anchor });
+  if (state.start && state.end) { q.set("start", state.start); q.set("end", state.end); }
   const r = await api("/report?" + q);
   renderCards(r);
   renderCategoryChart(r);
   renderTrendChart(r);
   renderCategoryTable(r);
+}
+
+async function loadRules() {
+  const rules = await api("/rules");
+  const body = $("#rulesTable").querySelector("tbody");
+  if (!rules.length) {
+    body.innerHTML = `<tr><td class="empty">No learned rules yet — assign a category on the left.</td></tr>`;
+    return;
+  }
+  body.innerHTML = `<tr><th>Pattern</th><th>Category</th><th></th></tr>` + rules.map((r) => `
+    <tr>
+      <td>${esc(r.pattern)}${r.direction !== "any" ? ` <span class="pill">${esc(r.direction)}</span>` : ""}</td>
+      <td>${esc(r.category)}</td>
+      <td class="num"><button class="del" data-rule-id="${r.id}" title="Delete this rule">✕</button></td>
+    </tr>`).join("");
 }
 
 async function loadUncategorized() {
@@ -60,8 +78,8 @@ async function loadUncategorized() {
 
 function renderCards(r) {
   const t = r.totals, rg = r.range;
-  const floorNote = rg.clamped_to_debit_start
-    ? `<br><span style="font-size:11px;color:var(--accent)" title="History is limited to your debit account's earliest data, where income lands">⛏ from debit start</span>`
+  const floorNote = rg.clamped_to_history_start
+    ? `<br><span style="font-size:11px;color:var(--accent)" title="Limited to where the selected account(s) have data — for All accounts, the period where every imported source has statements">⛏ from data start</span>`
     : "";
   $("#cards").innerHTML = `
     ${card("Total spend", fmt.format(t.spend), "bad")}
@@ -84,22 +102,25 @@ function renderCategoryChart(r) {
   catChart = new Chart($("#catChart"), {
     type: "doughnut",
     data: { labels, datasets: [{ data, backgroundColor: labels.map((_, i) => PALETTE[i % PALETTE.length]), borderWidth: 0 }] },
-    options: { plugins: { legend: { position: "right", labels: { color: "#e6edf3", boxWidth: 12 } },
+    options: { plugins: { legend: { position: "right", labels: { color: cssVar("--text"), boxWidth: 12 } },
       tooltip: { callbacks: { label: (c) => `${c.label}: ${fmt.format(c.parsed)}` } } } },
   });
 }
 
 function renderTrendChart(r) {
-  const labels = r.monthly_trend.map((m) => m.month);
+  const labels = r.monthly_trend.map((m) => m.month + (m.partial ? " *" : ""));
   const data = r.monthly_trend.map((m) => m.spend);
+  // Partial months (range starts/ends mid-month) read low — draw them muted.
+  const colors = r.monthly_trend.map((m) => m.partial ? cssVar("--muted") : cssVar("--accent"));
   if (trendChart) trendChart.destroy();
   if (!labels.length) return;
   trendChart = new Chart($("#trendChart"), {
     type: "bar",
-    data: { labels, datasets: [{ label: "Spend", data, backgroundColor: "#4f9cf9", borderRadius: 5 }] },
-    options: { plugins: { legend: { display: false }, tooltip: { callbacks: { label: (c) => fmt.format(c.parsed.y) } } },
-      scales: { x: { ticks: { color: "#8b98a5" }, grid: { display: false } },
-        y: { ticks: { color: "#8b98a5", callback: (v) => "$" + v }, grid: { color: "#2e3742" } } } },
+    data: { labels, datasets: [{ label: "Spend", data, backgroundColor: colors, borderRadius: 5 }] },
+    options: { plugins: { legend: { display: false }, tooltip: { callbacks: {
+        label: (c) => fmt.format(c.parsed.y) + (r.monthly_trend[c.dataIndex].partial ? " (partial month)" : "") } } },
+      scales: { x: { ticks: { color: cssVar("--muted") }, grid: { display: false } },
+        y: { ticks: { color: cssVar("--muted"), callback: (v) => "$" + v }, grid: { color: cssVar("--border") } } } },
   });
 }
 
@@ -177,9 +198,23 @@ $("#ranges").addEventListener("click", (e) => {
   const btn = e.target.closest("button[data-range]");
   if (!btn) return;
   state.range = btn.dataset.range;
+  state.start = state.end = null;               // presets clear the custom range
+  $("#startDate").value = $("#endDate").value = "";
   $("#ranges").querySelectorAll("button").forEach((b) => b.classList.toggle("active", b === btn));
   loadReport();
 });
+
+function applyCustomDates() {
+  const start = $("#startDate").value, end = $("#endDate").value;
+  if (!start || !end) return;                   // wait until both are picked
+  state.start = start;
+  state.end = end;
+  $("#ranges").querySelectorAll("button").forEach((b) => b.classList.remove("active"));
+  loadReport();
+}
+$("#startDate").addEventListener("change", applyCustomDates);
+$("#endDate").addEventListener("change", applyCustomDates);
+
 $("#accountFilter").addEventListener("change", (e) => { state.account = e.target.value; loadReport(); });
 $("#anchorFilter").addEventListener("change", (e) => { state.anchor = e.target.value; loadReport(); });
 $("#uploadBtn").addEventListener("click", uploadFiles);
@@ -187,9 +222,47 @@ document.addEventListener("change", (e) => {
   const sel = e.target.closest("select.recat");
   if (sel && sel.value) recategorize(sel.dataset.desc, sel.value);
 });
+document.addEventListener("click", async (e) => {
+  const del = e.target.closest("button[data-rule-id]");
+  if (!del) return;
+  const r = await api(`/rules/${del.dataset.ruleId}`, { method: "DELETE" });
+  setToolsMsg(`Rule deleted; ${r.transactions_recategorized} transaction(s) re-categorized.`);
+  await refresh();
+});
+
+$("#addCatBtn").addEventListener("click", async () => {
+  const name = $("#newCatName").value.trim();
+  if (!name) return;
+  const fd = new FormData();
+  fd.append("name", name);
+  try {
+    await api("/categories", { method: "POST", body: fd });
+    $("#newCatName").value = "";
+    await loadCategories();
+    await loadUncategorized();                  // rebuild dropdowns with the new option
+    setToolsMsg(`Category "${name}" added.`);
+  } catch (err) {
+    setToolsMsg("Could not add category: " + err.message);
+  }
+});
+
+$("#resetBtn").addEventListener("click", async () => {
+  const typed = prompt("This deletes ALL transactions and learned rules. Type DELETE to confirm:");
+  if (typed !== "DELETE") { setToolsMsg("Reset cancelled."); return; }
+  const fd = new FormData();
+  fd.append("confirm", "DELETE");
+  const r = await api("/reset", { method: "POST", body: fd });
+  setToolsMsg(`Deleted ${r.transactions_deleted} transaction(s) and ${r.rules_deleted} rule(s).`);
+  await refresh();
+});
+
+function setToolsMsg(s) { $("#toolsMsg").textContent = s; }
+
+// Re-render charts when the OS theme flips so colors track the CSS variables.
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => loadReport());
 
 async function refresh() {
-  await Promise.all([loadAccounts(), loadReport(), loadUncategorized()]);
+  await Promise.all([loadAccounts(), loadReport(), loadUncategorized(), loadRules()]);
 }
 
 (async function init() {

@@ -48,6 +48,18 @@ def _make_hash(account: str, date: str, amount: float, description: str) -> str:
     return hashlib.sha1(key.encode("utf-8")).hexdigest()
 
 
+def _occurrence_hash(base_hash: str, occurrence: int) -> str:
+    """Hash for the Nth (N >= 1) identical transaction within one file.
+
+    Two genuinely separate purchases can share account/date/amount/description
+    (e.g. two identical coffees in a day). The first occurrence keeps the base
+    hash — so existing databases stay deduplicated — and each repeat gets a
+    derived hash. Bank exports list a day's rows in a stable order, so repeats
+    line up with themselves when an overlapping statement is re-imported.
+    """
+    return hashlib.sha1(f"{base_hash}|{occurrence}".encode("utf-8")).hexdigest()
+
+
 class Adapter:
     name = "base"
     account = "Unknown"
@@ -119,9 +131,7 @@ ADAPTERS: list[Adapter] = [
 ADAPTERS_BY_NAME = {a.name: a for a in ADAPTERS}
 
 
-def _best_adapter(header: list[str], forced: str | None) -> Adapter | None:
-    if forced:
-        return ADAPTERS_BY_NAME.get(forced)
+def _best_adapter(header: list[str]) -> Adapter | None:
     header_set = set(header)
     best, best_score = None, 0
     for adapter in ADAPTERS:
@@ -131,12 +141,32 @@ def _best_adapter(header: list[str], forced: str | None) -> Adapter | None:
     return best
 
 
+def _header_matches(adapter: Adapter, header: list[str], forced: bool) -> bool:
+    """Is this row the real header for `adapter`?
+
+    Auto-detect requires the full signature. A forced adapter only needs the
+    columns it actually reads (date/description/amount) — more lenient, so a
+    slightly changed export still imports, but still strict enough to skip
+    preamble/summary lines before the header.
+    """
+    header_set = set(header)
+    if forced:
+        return {adapter.date_col, adapter.desc_col, adapter.amount_col} <= header_set
+    return adapter.score(header_set) > 0
+
+
 def parse_csv_bytes(data: bytes, forced: str | None = None) -> tuple[Adapter, list[dict]]:
     """Detect the bank format and return (adapter, normalized_records).
 
     Tolerates a BOM and any leading preamble/summary lines that some banks
-    prepend before the real header row.
+    prepend before the real header row — including when `forced` names the
+    adapter explicitly.
     """
+    if forced and forced not in ADAPTERS_BY_NAME:
+        raise ParseError(
+            f"Unknown format {forced!r}. Valid formats: {sorted(ADAPTERS_BY_NAME)}"
+        )
+
     text = data.decode("utf-8-sig", errors="replace")
     rows = list(csv.reader(io.StringIO(text)))
     if not rows:
@@ -144,18 +174,27 @@ def parse_csv_bytes(data: bytes, forced: str | None = None) -> tuple[Adapter, li
 
     for i, raw_header in enumerate(rows):
         header = [c.strip().lower() for c in raw_header]
-        adapter = _best_adapter(header, forced)
-        if adapter and (forced or adapter.score(set(header)) > 0):
+        adapter = ADAPTERS_BY_NAME[forced] if forced else _best_adapter(header)
+        if adapter and _header_matches(adapter, header, forced=bool(forced)):
             records: list[dict] = []
+            occurrences: dict[str, int] = {}
             for raw in rows[i + 1:]:
                 if not any(c.strip() for c in raw):
                     continue
                 row = dict(zip(header, raw))
                 rec = adapter.parse_row(row)
                 if rec:
+                    n = occurrences.get(rec["hash"], 0)
+                    occurrences[rec["hash"]] = n + 1
+                    if n:
+                        rec["hash"] = _occurrence_hash(rec["hash"], n)
                     records.append(rec)
             return adapter, records
 
+    if forced:
+        raise ParseError(
+            f"No header row with the columns required by format {forced!r} was found."
+        )
     raise ParseError(
         "Could not detect a supported bank format (Chase credit, Chase debit, "
         "or Bank of America credit). Check the CSV header row."

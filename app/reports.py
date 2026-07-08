@@ -10,17 +10,12 @@ statements usually lag real time. Pass `anchor="today"` for calendar-relative
 ranges, or explicit `start`/`end` to override entirely.
 """
 from __future__ import annotations
+import calendar
 from datetime import date, timedelta
 
 from .db import db
 
 EXCLUDED_FROM_SPEND = ("Transfer/Payment", "Income")
-
-# Income only lands in the debit account, so reports are only meaningful as far
-# back as the debit data goes. We floor every report's start date at the
-# earliest debit-account transaction. Matched loosely so any "...Debit" account
-# qualifies.
-INCOME_SOURCE_LIKE = "%Debit%"
 
 # range key -> number of days back from the anchor. "all" handled separately.
 _RANGE_DAYS = {
@@ -31,11 +26,26 @@ _RANGE_DAYS = {
 }
 
 
-def _history_floor(conn) -> str | None:
-    """Earliest debit-account transaction date, or None if no debit data yet."""
+def _history_floor(conn, account: str | None = None) -> str | None:
+    """Start of trustworthy history, or None if there's no data yet.
+
+    Combined view: the latest "earliest transaction" across all imported
+    source accounts, so all-time reports only cover the window where every
+    source has data (a card whose statements start later would otherwise make
+    older months read artificially low). Single-account view: that account's
+    own earliest transaction, so filtering by card shows its full history.
+    """
+    if account and account != "all":
+        row = conn.execute(
+            "SELECT MIN(txn_date) AS m FROM transactions WHERE source_account = ?",
+            (account,),
+        ).fetchone()
+        return row["m"] if row and row["m"] else None
     row = conn.execute(
-        "SELECT MIN(txn_date) AS m FROM transactions WHERE source_account LIKE ?",
-        (INCOME_SOURCE_LIKE,),
+        """SELECT MAX(first) AS m FROM (
+               SELECT MIN(txn_date) AS first FROM transactions
+               GROUP BY source_account
+           )"""
     ).fetchone()
     return row["m"] if row and row["m"] else None
 
@@ -77,9 +87,10 @@ def build_report(range_key: str = "6mo", account: str | None = None,
     with db() as conn:
         start, end = date_bounds(conn, range_key, anchor, start, end)
 
-        # Floor history at the earliest debit-account transaction (where income
-        # lands) so we never report spending for periods with no income data.
-        floor = _history_floor(conn)
+        # Floor history at the start of trustworthy data: combined view uses
+        # the window where ALL sources have data; a single account uses its
+        # own earliest transaction.
+        floor = _history_floor(conn, account)
         clamped = bool(floor and start < floor)
         if clamped:
             start = floor
@@ -147,11 +158,20 @@ def build_report(range_key: str = "6mo", account: str | None = None,
             base_params,
         ).fetchone()["n"]
 
+    # Flag months the range only partially covers — they read artificially low.
+    monthly_trend = []
+    for r in trend:
+        row = dict(r)
+        month = row["month"]
+        last_day = calendar.monthrange(int(month[:4]), int(month[5:7]))[1]
+        row["partial"] = start > f"{month}-01" or end < f"{month}-{last_day:02d}"
+        monthly_trend.append(row)
+
     income = income_row["income"] or 0.0
     return {
         "range": {"key": range_key, "start": start, "end": end,
                   "anchor": anchor, "account": account or "all",
-                  "debit_floor": floor, "clamped_to_debit_start": clamped},
+                  "history_floor": floor, "clamped_to_history_start": clamped},
         "totals": {
             "spend": total_spend,
             "income": income,
@@ -160,5 +180,5 @@ def build_report(range_key: str = "6mo", account: str | None = None,
         },
         "by_category": by_category,
         "top_per_category": top_per_category,
-        "monthly_trend": [dict(r) for r in trend],
+        "monthly_trend": monthly_trend,
     }

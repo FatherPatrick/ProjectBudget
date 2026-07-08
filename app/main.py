@@ -1,17 +1,18 @@
 """ProjectBudget — local FastAPI app.
 
-Phases 1-3 implemented here: scaffold, CSV import pipeline, and categorization.
-Reports API (phase 4) and the web dashboard (phase 5) come next; for now the
-JSON endpoints below make the import + categorize flow fully testable.
+All endpoints for the import + categorize + report flow, plus the dashboard.
 
 Run:  run.bat   (or)  python -m uvicorn app.main:app --port 8000
 """
 from __future__ import annotations
+import csv
+import io
 import sqlite3
+from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, File, Form, Query, UploadFile, HTTPException
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import categorize as cat
@@ -21,13 +22,27 @@ from .importers import parse_csv_bytes, ParseError, ADAPTERS
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
-app = FastAPI(title="ProjectBudget", version="0.1.0")
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    init_db()
+    yield
+
+
+app = FastAPI(title="ProjectBudget", version="0.2.0", lifespan=_lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
-@app.on_event("startup")
-def _startup() -> None:
-    init_db()
+def _category_names() -> set[str]:
+    with db() as conn:
+        rows = conn.execute("SELECT name FROM categories").fetchall()
+    return {r["name"] for r in rows}
+
+
+def _require_valid_category(category: str) -> None:
+    valid = _category_names()
+    if category not in valid:
+        raise HTTPException(400, f"Unknown category. Valid: {sorted(valid)}")
 
 
 @app.get("/")
@@ -42,7 +57,7 @@ async def upload(
 ):
     """Import one or more CSVs. `format` optionally forces an adapter
     (chase_credit | chase_debit | bofa_credit) when auto-detect fails."""
-    rules = cat._db_rules()
+    rules = cat.get_rules()
     results = []
     total_inserted = total_dupes = 0
 
@@ -114,7 +129,7 @@ def summary():
 
 
 @app.get("/transactions")
-def transactions(limit: int = 50, category: str | None = None):
+def transactions(limit: int = Query(50, ge=1, le=1000), category: str | None = None):
     query = "SELECT id, txn_date, description, amount, source_account, category FROM transactions"
     params: list = []
     if category:
@@ -128,7 +143,7 @@ def transactions(limit: int = 50, category: str | None = None):
 
 
 @app.get("/uncategorized")
-def uncategorized(limit: int = 100):
+def uncategorized(limit: int = Query(100, ge=1, le=1000)):
     """Distinct uncategorized descriptions, busiest first — the queue to teach."""
     with db() as conn:
         rows = conn.execute(
@@ -143,6 +158,12 @@ def uncategorized(limit: int = 100):
     return [dict(r) for r in rows]
 
 
+@app.get("/rules")
+def rules():
+    """All learned rules, priority-sorted (the management view)."""
+    return cat.list_rules()
+
+
 @app.post("/rules")
 def create_rule(pattern: str = Form(...), category: str = Form(...),
                 direction: str = Form(default="any")):
@@ -150,22 +171,44 @@ def create_rule(pattern: str = Form(...), category: str = Form(...),
 
     direction: 'any' (default) | 'in' (only money-in txns) | 'out' (only spend).
     """
-    valid = {c["name"] for c in _categories()}
-    if category not in valid:
-        raise HTTPException(400, f"Unknown category. Valid: {sorted(valid)}")
+    _require_valid_category(category)
     cat.add_rule(pattern, category, direction=direction)
     changed = cat.reapply_all()
     return {"pattern": pattern, "category": category, "direction": direction,
             "transactions_recategorized": changed}
 
 
+@app.delete("/rules/{rule_id}")
+def remove_rule(rule_id: int):
+    """Delete a learned rule, then re-categorize everything without it."""
+    if not cat.delete_rule(rule_id):
+        raise HTTPException(404, "Rule not found")
+    changed = cat.reapply_all()
+    return {"deleted": rule_id, "transactions_recategorized": changed}
+
+
 @app.get("/categories")
-def _categories():
+def categories():
     with db() as conn:
         rows = conn.execute(
             "SELECT name FROM categories ORDER BY sort_order, name"
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+@app.post("/categories")
+def create_category(name: str = Form(...)):
+    """Add a custom category (appears after the defaults in dropdowns)."""
+    name = name.strip()
+    if not name:
+        raise HTTPException(400, "Category name is empty")
+    if name in _category_names():
+        raise HTTPException(409, f"Category {name!r} already exists")
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO categories(name, sort_order) VALUES (?, 100)", (name,)
+        )
+    return {"name": name}
 
 
 @app.get("/accounts")
@@ -179,15 +222,15 @@ def accounts():
 
 
 @app.get("/report")
-def report(range: str = "6mo", account: str | None = None,
+def report(range_key: str = Query("6mo", alias="range"), account: str | None = None,
            anchor: str = "latest", start: str | None = None,
-           end: str | None = None, top_n: int = 5):
+           end: str | None = None, top_n: int = Query(5, ge=1, le=50)):
     """Full report payload: totals, spend-by-category, top-N per category, trend.
 
     range: 30d | 3mo | 6mo | 1yr | all  (ignored if start & end are given).
     anchor: latest (most recent txn) | today.
     """
-    return reports.build_report(range_key=range, account=account, anchor=anchor,
+    return reports.build_report(range_key=range_key, account=account, anchor=anchor,
                                  start=start, end=end, top_n=top_n)
 
 
@@ -197,12 +240,12 @@ def set_category(txn_id: int, category: str = Form(...),
                  pattern: str | None = Form(default=None)):
     """Re-categorize a single transaction. Optionally learn a rule from it.
 
-    If make_rule is true, a rule is created from `pattern` (or the transaction's
-    full description if no pattern is given) so similar transactions auto-match.
+    The transaction is pinned (manually_set = 1) so later rule changes never
+    silently overwrite an explicit per-transaction choice. If make_rule is
+    true, a rule is also created from `pattern` (or the transaction's full
+    description) so similar transactions auto-match.
     """
-    valid = {c["name"] for c in _categories()}
-    if category not in valid:
-        raise HTTPException(400, f"Unknown category. Valid: {sorted(valid)}")
+    _require_valid_category(category)
     with db() as conn:
         row = conn.execute(
             "SELECT description FROM transactions WHERE id = ?", (txn_id,)
@@ -210,7 +253,8 @@ def set_category(txn_id: int, category: str = Form(...),
         if not row:
             raise HTTPException(404, "Transaction not found")
         conn.execute(
-            "UPDATE transactions SET category = ? WHERE id = ?", (category, txn_id)
+            "UPDATE transactions SET category = ?, manually_set = 1 WHERE id = ?",
+            (category, txn_id),
         )
 
     recategorized = 0
@@ -219,3 +263,41 @@ def set_category(txn_id: int, category: str = Form(...),
         recategorized = cat.reapply_all()
     return {"id": txn_id, "category": category, "rule_created": bool(make_rule),
             "transactions_recategorized": recategorized}
+
+
+@app.get("/export/transactions.csv")
+def export_transactions():
+    """Download every stored transaction as a CSV backup."""
+    with db() as conn:
+        rows = conn.execute(
+            """SELECT txn_date, description, amount, source_account,
+                      raw_category, category, manually_set
+               FROM transactions ORDER BY txn_date, id"""
+        ).fetchall()
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\n")
+    writer.writerow(["date", "description", "amount", "account",
+                     "raw_category", "category", "manually_set"])
+    for r in rows:
+        writer.writerow([r["txn_date"], r["description"], r["amount"],
+                         r["source_account"], r["raw_category"],
+                         r["category"], r["manually_set"]])
+    buf.seek(0)
+    return StreamingResponse(
+        buf, media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=transactions.csv"},
+    )
+
+
+@app.post("/reset")
+def reset(confirm: str = Form(...)):
+    """Danger zone: wipe all transactions and learned rules (categories stay).
+
+    Requires the literal confirmation string DELETE to guard against accidents.
+    """
+    if confirm != "DELETE":
+        raise HTTPException(400, 'Pass confirm="DELETE" to wipe all data.')
+    with db() as conn:
+        txns = conn.execute("DELETE FROM transactions").rowcount
+        rules_n = conn.execute("DELETE FROM rules").rowcount
+    return {"transactions_deleted": txns, "rules_deleted": rules_n}

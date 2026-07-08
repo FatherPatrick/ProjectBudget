@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS transactions (
     source_account TEXT    NOT NULL,
     raw_category   TEXT    DEFAULT '',          -- bank-provided category, if any
     category       TEXT    NOT NULL DEFAULT 'Uncategorized',
+    manually_set   INTEGER NOT NULL DEFAULT 0,  -- 1 = user pinned the category; rules won't touch it
     hash           TEXT    NOT NULL UNIQUE,     -- dedupe key for re-uploads
     created_at     TEXT    DEFAULT CURRENT_TIMESTAMP
 );
@@ -63,6 +64,11 @@ def _migrate(conn) -> None:
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(rules)").fetchall()}
     if "direction" not in cols:
         conn.execute("ALTER TABLE rules ADD COLUMN direction TEXT NOT NULL DEFAULT 'any'")
+    txn_cols = {r["name"] for r in conn.execute("PRAGMA table_info(transactions)").fetchall()}
+    if "manually_set" not in txn_cols:
+        conn.execute(
+            "ALTER TABLE transactions ADD COLUMN manually_set INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 def get_connection() -> sqlite3.Connection:
